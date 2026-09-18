@@ -8,9 +8,16 @@ Claude's per-user package registry hive loaded (...\Packages\Claude_pzs8sxrjxfjj
 Helium), so Windows cannot create the sandbox for the new version. Settings > Apps > Repair does not
 stop that process; stopping the process does.
 
+Two kinds of leftover are looked for:
+  1. processes that still carry an OLDER version's package identity (tasklist /apps shows them);
+  2. processes spawned from a Claude Code session - the CLI under ...\Claude\claude-code\, its shells
+     and whatever they started. They carry no package identity, so tasklist /apps does not list
+     them, but they were started inside the sandbox and keep it alive.
+
 Run: double-click Fix-ClaudeLaunch.cmd, or
      powershell -NoProfile -ExecutionPolicy Bypass -File Fix-ClaudeLaunch.ps1 [-DryRun]
 -DryRun only reports what it finds; it never stops or launches anything.
+Run it as administrator if the normal run finds nothing: processes started elevated are invisible otherwise.
 #>
 param([switch]$DryRun)
 
@@ -26,6 +33,32 @@ function Write-Log([string]$Text) {
 function Confirm-Step([string]$Question) {
     if ($DryRun) { Write-Host "[dry run] would ask: $Question"; return $false }
     return (Read-Host "$Question [y/N]") -match '^(y|yes)$'
+}
+
+function Format-Procs($Procs) {
+    ($Procs | Sort-Object Stale, Role | Format-Table PID, Image, Role, Package, Started -AutoSize | Out-String -Width 250).TrimEnd()
+}
+
+# Evidence for a bug report, and hints when the normal fix did not help.
+function Write-Diagnostics {
+    Write-Log '--- diagnostics ---'
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Write-Log "Running elevated: $elevated" + $(if (-not $elevated) { '  (processes started as administrator were invisible above; try again as administrator)' })
+    $svc = Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction SilentlyContinue
+    if ($svc) { Write-Log "CoworkVMService: $($svc.State), PID $($svc.ProcessId), $($svc.PathName)" }
+    $hive = Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\SystemAppData\Helium'
+    foreach ($f in 'User.dat', 'UserClasses.dat') {
+        $p = Join-Path $hive $f
+        if (-not (Test-Path $p)) { Write-Log "$f : absent"; continue }
+        try { $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); $fs.Close(); Write-Log "$f : not locked (the sandbox is gone; the launch error has another cause)" }
+        catch { Write-Log "$f : LOCKED - something still holds the old sandbox open" }
+    }
+    $events = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AppModel-Runtime/Admin'; StartTime = (Get-Date).AddHours(-2) } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -match 'Claude_' } | Select-Object -First 12
+    foreach ($e in $events) {
+        $m = ($e.Message -replace '\s+', ' ')
+        Write-Log ('event {0} {1:HH:mm:ss} {2}' -f $e.Id, $e.TimeCreated, $m.Substring(0, [Math]::Min(160, $m.Length)))
+    }
 }
 
 $cim = @{}
@@ -64,7 +97,7 @@ if ($pkg) {
 } else {
     # Not the Store build. The .exe-installer build is blocked the same way when a claude.exe never
     # exits, so offer the generic version of the fix. The Claude Code CLI is also named claude.exe
-    # (it lives under ...\Claude\claude-code\) and is left alone.
+    # (it lives under ...\Claude\claude-code\) and is handled as a leftover below.
     Write-Log 'The Store (MSIX) build of Claude is not installed for this user; checking for leftover claude.exe processes instead.'
     $claudeProcs = @($cim.Values |
         Where-Object { $_.Name -ieq 'claude.exe' -and $_.ExecutablePath -notmatch '\\claude-code\\' } |
@@ -84,19 +117,67 @@ if ($pkg) {
         })
 }
 
-if ($claudeProcs.Count -eq 0) {
-    Write-Log 'No Claude processes are running.'
-} else {
-    Write-Log ($claudeProcs | Sort-Object Stale, Role | Format-Table PID, Image, Role, Package, Started -AutoSize | Out-String -Width 250).TrimEnd()
+# Leftovers without package identity: the Claude Code CLI, anything running from Claude's install
+# folder that tasklist /apps missed, and every descendant of those. This script's own process tree
+# is left alone so it can finish.
+$seen = @{}
+$claudeProcs | ForEach-Object { $seen[$_.PID] = $true }
+$me = $PID
+while ($me -and $cim[$me]) { $seen[$me] = $true; $me = [int]$cim[$me].ParentProcessId; if ($me -eq 0) { break } }
+# A process whose ancestor chain still reaches a running current-version Claude belongs to a live
+# session, not to a dead sandbox.
+$liveIds = @{}
+$claudeProcs | Where-Object { -not $_.Stale } | ForEach-Object { $liveIds[$_.PID] = $true }
+function Test-LiveAncestor([int]$Id) {
+    $hops = 0
+    while ($Id -and $cim[$Id] -and $hops -lt 32) {
+        $Id = [int]$cim[$Id].ParentProcessId
+        if ($liveIds[$Id]) { return $true }
+        $hops++
+    }
+    return $false
+}
+$queue = New-Object System.Collections.Queue
+$cim.Values | Where-Object {
+    -not $seen[[int]$_.ProcessId] -and $_.ExecutablePath -and
+    ($_.ExecutablePath -match '\\Claude\\claude-code\\' -or $_.ExecutablePath -like 'C:\Program Files\WindowsApps\Claude_*') -and
+    -not (Test-LiveAncestor ([int]$_.ProcessId))
+} | ForEach-Object { $queue.Enqueue($_) }
+$leftovers = @()
+while ($queue.Count -gt 0) {
+    $p = $queue.Dequeue()
+    $id = [int]$p.ProcessId
+    if ($seen[$id]) { continue }
+    $seen[$id] = $true
+    $leftovers += [pscustomobject]@{
+        PID     = $id
+        Image   = $p.Name
+        Role    = 'no package identity'
+        Package = [string]$p.ExecutablePath
+        Started = $p.CreationDate
+        Stale   = $true
+        Cmd     = [string]$p.CommandLine
+    }
+    $cim.Values | Where-Object { $_.ParentProcessId -eq $id } | ForEach-Object { $queue.Enqueue($_) }
 }
 
-$stale = @($claudeProcs | Where-Object { $_.Stale })
+if ($claudeProcs.Count -eq 0 -and $leftovers.Count -eq 0) {
+    Write-Log 'No Claude processes are running.'
+}
+if ($claudeProcs.Count -gt 0) { Write-Log (Format-Procs $claudeProcs) }
+if ($leftovers.Count -gt 0) {
+    Write-Log "$($leftovers.Count) process(es) come from a Claude Code session and carry no package identity; they can hold the old sandbox open:"
+    Write-Log (Format-Procs $leftovers)
+}
+
+$stale = @($claudeProcs | Where-Object { $_.Stale }) + $leftovers
 $current = @($claudeProcs | Where-Object { -not $_.Stale })
 $targets = @()
 
 if ($stale.Count -gt 0) {
-    Write-Log "$($stale.Count) process(es) belong to an OLDER Claude version and block the new one from starting."
-    if (Confirm-Step 'Stop them?') { $targets = $stale }
+    $old = @($claudeProcs | Where-Object { $_.Stale }).Count
+    if ($old -gt 0) { Write-Log "$old process(es) belong to an OLDER Claude version and block the new one from starting." }
+    if (Confirm-Step "Stop these $($stale.Count) old-version/leftover process(es)?") { $targets = $stale }
 } elseif ($current.Count -gt 0) {
     if ($pkg) { Write-Log 'No old-version leftovers; these are all the installed version.' }
     if (Confirm-Step 'Is Claude hung or windowless? Stop ALL Claude processes (closes Claude)?') { $targets = $current }
@@ -117,7 +198,7 @@ foreach ($t in $targets) {
     if ($t.Cmd) { Write-Log ('    ' + $t.Cmd.Substring(0, [Math]::Min(300, $t.Cmd.Length))) }
 }
 
-if ($targets.Count -eq 0 -and $claudeProcs.Count -gt 0) {
+if ($targets.Count -eq 0 -and ($claudeProcs.Count -gt 0 -or $leftovers.Count -gt 0)) {
     Write-Log 'Nothing stopped, so not relaunching.'
     exit 0
 }
@@ -132,7 +213,9 @@ if ($pkg) {
     $blocked = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AppModel-Runtime/Admin'; Id = 208, 215; StartTime = $launchedAt } -ErrorAction SilentlyContinue |
         Where-Object { $_.Message -match '0x80070020' -and $_.Message -match 'Claude_' }
     if ($blocked) {
-        Write-Log 'Still blocked (0x80070020). Sign out of Windows and back in; that clears it without a full reboot.'
+        Write-Log 'Still blocked (0x80070020).'
+        Write-Diagnostics
+        Write-Log 'Next: rerun this as administrator if it found nothing; otherwise sign out of Windows and back in (no full reboot needed).'
     } else {
         Write-Log 'No sandbox errors; Claude should be opening.'
     }
