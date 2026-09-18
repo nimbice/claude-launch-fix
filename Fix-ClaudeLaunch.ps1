@@ -8,11 +8,22 @@ Claude's per-user package registry hive loaded (...\Packages\Claude_pzs8sxrjxfjj
 Helium), so Windows cannot create the sandbox for the new version. Settings > Apps > Repair does not
 stop that process; stopping the process does.
 
-Two kinds of leftover are looked for:
+CONFIRMED CAUSE (2026-09-18): the process that stayed behind was the Android adb server (adb.exe),
+started by a command in a Claude Code session. adb detaches itself from the shell that started it,
+so it survives the app quitting, carries no package identity and has no Claude parent - but it was
+born inside Claude's sandbox and keeps it alive. Stopping adb released the hive immediately and
+Claude started. Sysinternals handle.exe finds nothing because adb holds no handle into the hive;
+being a member of the sandbox is enough.
+
+Three kinds of leftover are looked for:
   1. processes that still carry an OLDER version's package identity (tasklist /apps shows them);
   2. processes spawned from a Claude Code session - the CLI under ...\Claude\claude-code\, its shells
      and whatever they started. They carry no package identity, so tasklist /apps does not list
      them, but they were started inside the sandbox and keep it alive.
+  3. detached developer daemons such as the adb server and Gradle daemons. They have cut every tie
+     to the session that started them, so they are only tried when no Claude process is left and
+     the hive is still locked - one at a time, checking the hive after each, so the log names the
+     one that was responsible.
 
 Run: double-click Fix-ClaudeLaunch.cmd, or
      powershell -NoProfile -ExecutionPolicy Bypass -File Fix-ClaudeLaunch.ps1 [-DryRun]
@@ -39,6 +50,27 @@ function Format-Procs($Procs) {
     ($Procs | Sort-Object Stale, Role | Format-Table PID, Image, Role, Package, Started -AutoSize | Out-String -Width 250).TrimEnd()
 }
 
+function Test-HiveLocked {
+    # Only meaningful while no Claude process runs: a running Claude legitimately holds its hive.
+    $p = Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\SystemAppData\Helium\User.dat'
+    if (-not (Test-Path $p)) { return $false }
+    try { $fs = [System.IO.File]::Open($p, 'Open', 'ReadWrite', 'None'); $fs.Close(); return $false }
+    catch { return $true }
+}
+
+# Daemons that detach from the shell that started them. adb is the confirmed culprit; a Gradle
+# daemon started from a Claude Code session is the same kind of process. adb sorts first.
+function Get-DetachedDaemons {
+    @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -ieq 'adb.exe' -or ($_.Name -ieq 'java.exe' -and $_.CommandLine -match 'GradleDaemon')
+    } | Sort-Object Name)
+}
+
+function Get-DaemonLabel($Proc) {
+    if ($Proc.Name -ieq 'adb.exe') { "adb server (PID $($Proc.ProcessId), $($Proc.ExecutablePath))" }
+    else { "Gradle daemon (PID $($Proc.ProcessId))" }
+}
+
 # Evidence for a bug report, and hints when the normal fix did not help.
 function Write-Diagnostics {
     Write-Log '--- diagnostics ---'
@@ -53,8 +85,8 @@ function Write-Diagnostics {
         try { $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); $fs.Close(); Write-Log "$f : not locked (the sandbox is gone; the launch error has another cause)" }
         catch { Write-Log "$f : LOCKED - something still holds the old sandbox open" }
     }
-    # With no Claude process left, the holder is some other program with a registry handle inside
-    # Claude's virtualized hive. A mounted package hive is named \REGISTRY\A\{GUID}, not after the
+    # The holder found so far (adb) had no handle inside the hive at all, so an empty handle search
+    # clears nobody; it is still logged because a real handle would name its owner. A mounted package hive is named \REGISTRY\A\{GUID}, not after the
     # package; the hivelist key maps the hive file to that GUID, and Sysinternals handle.exe (on the
     # PATH, run elevated) can then name every process holding a key under it.
     $mounted = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\hivelist' -ErrorAction SilentlyContinue).PSObject.Properties |
@@ -203,6 +235,10 @@ if ($stale.Count -gt 0) {
 }
 
 if ($DryRun) {
+    if ($pkg -and $current.Count -eq 0 -and (Test-HiveLocked)) {
+        Write-Host 'The package hive is locked although no Claude process runs: the old sandbox is still alive.'
+        foreach ($d in Get-DetachedDaemons) { Write-Host "[dry run] would offer to stop: $(Get-DaemonLabel $d)" }
+    }
     Write-Host '[dry run] nothing was stopped or launched.'
     exit 0
 }
@@ -223,6 +259,24 @@ if ($targets.Count -eq 0 -and ($claudeProcs.Count -gt 0 -or $leftovers.Count -gt
 }
 if ($targets.Count -gt 0) { Start-Sleep -Seconds 3 }
 
+# Kind 3: nothing of Claude is left, yet its hive is still locked, so something born in the old
+# sandbox is still running. Try the detached daemons one at a time.
+$claudeLeft = @($current | Where-Object { $targets.PID -notcontains $_.PID }).Count
+if ($pkg -and $claudeLeft -eq 0 -and (Test-HiveLocked)) {
+    Write-Log 'No Claude process is left but the package hive is still locked: the old sandbox is still alive.'
+    $daemons = Get-DetachedDaemons
+    if ($daemons.Count -eq 0) { Write-Log 'No adb server or Gradle daemon is running, so the holder is something else.' }
+    foreach ($d in $daemons) {
+        $label = Get-DaemonLabel $d
+        if (-not (Confirm-Step "Stop the $label? (not while a build or device session depends on it)")) { continue }
+        if ($d.Name -ieq 'adb.exe' -and $d.ExecutablePath) { & $d.ExecutablePath kill-server 2>&1 | Out-Null; Start-Sleep -Seconds 2 }
+        Stop-Process -Id $d.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        if (Test-HiveLocked) { Write-Log "Stopped the $label; hive still locked." }
+        else { Write-Log "Stopped the $label; HIVE RELEASED - this was the process holding the old sandbox."; break }
+    }
+}
+
 $launchedAt = Get-Date
 if ($pkg) {
     Start-Process explorer.exe -ArgumentList "shell:AppsFolder\$($pkg.PackageFamilyName)!Claude"
@@ -234,7 +288,7 @@ if ($pkg) {
     if ($blocked) {
         Write-Log 'Still blocked (0x80070020).'
         Write-Diagnostics
-        Write-Log 'Next: rerun this as administrator if it found nothing; otherwise sign out of Windows and back in (no full reboot needed).'
+        Write-Log 'Next: rerun as administrator if nothing was found. Otherwise stop any other program that was started from a Claude Code session and is still running (servers, emulators, watchers), or sign out of Windows and back in (no full reboot needed).'
     } else {
         Write-Log 'No sandbox errors; Claude should be opening.'
     }
