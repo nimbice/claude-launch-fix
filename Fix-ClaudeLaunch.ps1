@@ -53,6 +53,15 @@ function Write-Diagnostics {
         try { $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); $fs.Close(); Write-Log "$f : not locked (the sandbox is gone; the launch error has another cause)" }
         catch { Write-Log "$f : LOCKED - something still holds the old sandbox open" }
     }
+    # With no Claude process left, the holder is some other program with a registry handle inside
+    # Claude's virtualized hive. Sysinternals handle.exe can name it (needs to be on the PATH, run elevated).
+    $handleExe = Get-Command handle64.exe, handle.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($handleExe) {
+        Write-Log "handles mentioning the package (via $($handleExe.Name)):"
+        & $handleExe.Source -accepteula -nobanner -a Claude_pzs8sxrjxfjjc 2>&1 | Select-Object -First 40 | ForEach-Object { Write-Log "    $_" }
+    } else {
+        Write-Log 'To identify the holder next time: install Sysinternals Suite (Microsoft Store) and rerun as administrator, or in Process Explorer use Find > Find Handle or DLL for "Claude_pzs8sxrjxfjjc".'
+    }
     $events = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AppModel-Runtime/Admin'; StartTime = (Get-Date).AddHours(-2) } -ErrorAction SilentlyContinue |
         Where-Object { $_.Message -match 'Claude_' } | Select-Object -First 12
     foreach ($e in $events) {
@@ -139,7 +148,7 @@ function Test-LiveAncestor([int]$Id) {
 }
 $queue = New-Object System.Collections.Queue
 $cim.Values | Where-Object {
-    -not $seen[[int]$_.ProcessId] -and $_.ExecutablePath -and
+    -not $seen[[int]$_.ProcessId] -and $_.ExecutablePath -and $_.Name -ine 'cowork-svc.exe' -and
     ($_.ExecutablePath -match '\\Claude\\claude-code\\' -or $_.ExecutablePath -like 'C:\Program Files\WindowsApps\Claude_*') -and
     -not (Test-LiveAncestor ([int]$_.ProcessId))
 } | ForEach-Object { $queue.Enqueue($_) }
