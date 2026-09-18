@@ -54,13 +54,22 @@ function Write-Diagnostics {
         catch { Write-Log "$f : LOCKED - something still holds the old sandbox open" }
     }
     # With no Claude process left, the holder is some other program with a registry handle inside
-    # Claude's virtualized hive. Sysinternals handle.exe can name it (needs to be on the PATH, run elevated).
+    # Claude's virtualized hive. A mounted package hive is named \REGISTRY\A\{GUID}, not after the
+    # package; the hivelist key maps the hive file to that GUID, and Sysinternals handle.exe (on the
+    # PATH, run elevated) can then name every process holding a key under it.
+    $mounted = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\hivelist' -ErrorAction SilentlyContinue).PSObject.Properties |
+        Where-Object { $_.Value -match 'Claude_pzs8sxrjxfjjc' })
+    if ($mounted.Count -eq 0) { Write-Log 'hivelist: no Claude hive is mounted' }
+    foreach ($m in $mounted) { Write-Log "hivelist: $($m.Name) = $($m.Value)" }
     $handleExe = Get-Command handle64.exe, handle.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($handleExe) {
-        Write-Log "handles mentioning the package (via $($handleExe.Name)):"
-        & $handleExe.Source -accepteula -nobanner -a Claude_pzs8sxrjxfjjc 2>&1 | Select-Object -First 40 | ForEach-Object { Write-Log "    $_" }
+    if (-not $handleExe) {
+        Write-Log 'To identify the holder next time: install Sysinternals Suite (Microsoft Store) and rerun as administrator.'
     } else {
-        Write-Log 'To identify the holder next time: install Sysinternals Suite (Microsoft Store) and rerun as administrator, or in Process Explorer use Find > Find Handle or DLL for "Claude_pzs8sxrjxfjjc".'
+        $guids = @($mounted | ForEach-Object { if ($_.Name -match '\{[0-9A-Fa-f-]+\}') { $Matches[0] } } | Select-Object -Unique)
+        foreach ($g in $guids + 'Helium') {
+            Write-Log "handles matching $g (via $($handleExe.Name)):"
+            & $handleExe.Source -accepteula -nobanner -a $g 2>&1 | Select-Object -First 40 | ForEach-Object { Write-Log "    $_" }
+        }
     }
     $events = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AppModel-Runtime/Admin'; StartTime = (Get-Date).AddHours(-2) } -ErrorAction SilentlyContinue |
         Where-Object { $_.Message -match 'Claude_' } | Select-Object -First 12
