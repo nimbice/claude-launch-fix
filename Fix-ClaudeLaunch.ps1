@@ -65,7 +65,8 @@ function Write-Diagnostics {
     if (-not $handleExe) {
         Write-Log 'To identify the holder next time: install Sysinternals Suite (Microsoft Store) and rerun as administrator.'
     } else {
-        $guids = @($mounted | ForEach-Object { if ($_.Name -match '\{[0-9A-Fa-f-]+\}') { $Matches[0] } } | Select-Object -Unique)
+        # Names look like \REGISTRY\WC\Silo<guid>user_sid - the GUID carries no braces.
+        $guids = @($mounted | ForEach-Object { if ($_.Name -match 'Silo([0-9A-Fa-f-]{36})') { $Matches[1] } } | Select-Object -Unique)
         foreach ($g in $guids + 'Helium') {
             Write-Log "handles matching $g (via $($handleExe.Name)):"
             & $handleExe.Source -accepteula -nobanner -a $g 2>&1 | Select-Object -First 40 | ForEach-Object { Write-Log "    $_" }
